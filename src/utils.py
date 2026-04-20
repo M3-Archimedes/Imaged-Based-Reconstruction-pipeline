@@ -28,6 +28,8 @@ DEFAULT_RENAME_MAP = {
     "TRIP": "trip_id",
 }
 
+TRIP_REQUIRED_COLUMNS = ("trip_id", "time", "lon", "lat", "h3")
+
 
 def _build_trip_rename_map(
     h3_resolution: Optional[int] = None,
@@ -99,6 +101,46 @@ def prepare_trip_df(
     return trip_df
 
 
+def _select_trip_rows(trip_df: pd.DataFrame, trip_id: str) -> pd.DataFrame:
+    trip_slice = trip_df[trip_df["trip_id"] == trip_id].copy()
+    if len(trip_slice) == 0:
+        raise ValueError(f"No rows found for trip_id={trip_id}")
+    return trip_slice.sort_values("time").reset_index(drop=True)
+
+
+def _interpolate_trip_coords(
+    time_one: pd.Timestamp,
+    lon_one: float,
+    lat_one: float,
+    time_two: pd.Timestamp,
+    lon_two: float,
+    lat_two: float,
+    target_time: pd.Timestamp,
+) -> tuple[float, float]:
+    total_duration = (time_two - time_one).total_seconds()
+    if total_duration == 0:
+        return lon_one, lat_one
+    elapsed = (target_time - time_one).total_seconds()
+    ratio = max(0.0, min(1.0, elapsed / total_duration))
+    return lon_one + ratio * (lon_two - lon_one), lat_one + ratio * (lat_two - lat_one)
+
+
+def _find_known_trip_neighbors(
+    trip_df: pd.DataFrame,
+    start_index: int,
+    end_index: int,
+) -> tuple[int, int]:
+    previous_index = start_index - 1
+    while previous_index >= 0 and pd.isna(trip_df.loc[previous_index, "lon"]):
+        previous_index -= 1
+
+    next_index = end_index + 1
+    while next_index < len(trip_df) and pd.isna(trip_df.loc[next_index, "lon"]):
+        next_index += 1
+
+    return previous_index, next_index
+
+
 def compute_longest_trip_duration_seconds(
     trip_data: str | Path | pd.DataFrame,
     rename_map: Optional[Mapping[str, str]] = None,
@@ -126,7 +168,7 @@ def clean_trip_dataset(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     trip_df = prepare_trip_df(
         trip_data,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     )
@@ -176,7 +218,7 @@ def augment_trip(
 ) -> pd.DataFrame:
     trip_df = prepare_trip_df(
         trip_data,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     )
@@ -189,14 +231,7 @@ def augment_trip(
     if longest_trip_duration_seconds <= 0:
         raise ValueError("longest_trip_duration_seconds must be positive.")
 
-    trip_filtered = (
-        trip_df[trip_df["trip_id"] == trip_id]
-        .loc[:, ["time", "lon", "lat", "h3", "trip_id"]]
-        .sort_values("time")
-        .reset_index(drop=True)
-    )
-    if len(trip_filtered) == 0:
-        raise ValueError(f"No rows found for trip_id={trip_id}")
+    trip_filtered = _select_trip_rows(trip_df, trip_id).loc[:, ["time", "lon", "lat", "h3", "trip_id"]]
 
     trip_start = trip_filtered["time"].iloc[0]
     trip_end = trip_start + pd.Timedelta(seconds=longest_trip_duration_seconds)
@@ -327,7 +362,7 @@ def augment_all_trips(
 ) -> pd.DataFrame:
     trip_df = prepare_trip_df(
         trip_data,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     )
@@ -718,7 +753,7 @@ def save_wave_maps_for_all_trips(
 ) -> tuple[list[str], float]:
     trip_df = prepare_trip_df(
         trip_data,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     )
@@ -889,6 +924,53 @@ def load_checkpoint_model_state(
     raise ValueError(f"Unsupported checkpoint format in {checkpoint_path}")
 
 
+def _build_masked_inpainting_input(
+    image_array: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    masked_image = image_array.copy()
+    mask_three_channel = np.repeat(mask, 3, axis=0)
+    masked_image[mask_three_channel == 0] = 1.0
+    input_array = np.concatenate([masked_image, mask], axis=0).astype(np.float32)
+    return masked_image, input_array
+
+
+def _run_inpainting_model(
+    model: nn.Module,
+    input_array: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
+    input_tensor = torch.from_numpy(input_array).float().unsqueeze(0).to(device)
+    try:
+        model.eval()
+        use_amp = device.type == "cuda"
+        if use_amp:
+            with torch.amp.autocast("cuda"):
+                output = model(input_tensor)
+        else:
+            output = model(input_tensor)
+        return output.squeeze(0).cpu().numpy().astype(np.float32)
+    finally:
+        del input_tensor
+
+
+def _compute_inpainting_losses(
+    output: torch.Tensor,
+    batch_target: torch.Tensor,
+    batch_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mse_loss = (output - batch_target) ** 2
+    l1_loss = torch.abs(output - batch_target)
+    missing_mask = (batch_mask == 0).expand_as(mse_loss)
+    full_loss = mse_loss.mean() + l1_loss.mean()
+    if bool(missing_mask.any()):
+        masked_loss = mse_loss[missing_mask].mean() + l1_loss[missing_mask].mean()
+    else:
+        masked_loss = full_loss
+    total_loss = 0.2 * full_loss + 0.8 * masked_loss
+    return total_loss, masked_loss
+
+
 class H3ColorQuantizer:
     def __init__(self, h3_color_map: dict[str, Sequence[float]]):
         self.h3_cells = list(h3_color_map.keys())
@@ -1029,10 +1111,7 @@ class H3InpaintDatasetAugmented(Dataset):
         image_array = load_wave_map_image(self.image_paths[image_index])
         _, height, width = image_array.shape
         mask = self._create_mask(height, width, config_index, position_index, num_positions)
-        masked_image = image_array.copy()
-        mask_three_channel = np.repeat(mask, 3, axis=0)
-        masked_image[mask_three_channel == 0] = 1.0
-        input_tensor = np.concatenate([masked_image, mask], axis=0).astype(np.float32)
+        _, input_tensor = _build_masked_inpainting_input(image_array, mask)
         return (
             torch.from_numpy(input_tensor).float(),
             torch.from_numpy(image_array).float(),
@@ -1095,42 +1174,20 @@ def train_h3_inpainting(
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     output = model(batch_input)
-                    mse_loss = (output - batch_target) ** 2
-                    l1_loss = torch.abs(output - batch_target)
-                    missing_mask = (batch_mask == 0).expand_as(mse_loss)
-                    full_mse = mse_loss.mean()
-                    full_l1 = l1_loss.mean()
-                    if missing_mask.sum() > 0:
-                        masked_mse = mse_loss[missing_mask].mean()
-                        masked_l1 = l1_loss[missing_mask].mean()
-                    else:
-                        masked_mse = full_mse
-                        masked_l1 = full_l1
-                    loss = 0.2 * (full_mse + full_l1) + 0.8 * (masked_mse + masked_l1)
+                    loss, masked_loss = _compute_inpainting_losses(output, batch_target, batch_mask)
                 assert scaler is not None
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 output = model(batch_input)
-                mse_loss = (output - batch_target) ** 2
-                l1_loss = torch.abs(output - batch_target)
-                missing_mask = (batch_mask == 0).expand_as(mse_loss)
-                full_mse = mse_loss.mean()
-                full_l1 = l1_loss.mean()
-                if missing_mask.sum() > 0:
-                    masked_mse = mse_loss[missing_mask].mean()
-                    masked_l1 = l1_loss[missing_mask].mean()
-                else:
-                    masked_mse = full_mse
-                    masked_l1 = full_l1
-                loss = 0.2 * (full_mse + full_l1) + 0.8 * (masked_mse + masked_l1)
+                loss, masked_loss = _compute_inpainting_losses(output, batch_target, batch_mask)
                 loss.backward()
                 optimizer.step()
 
             scheduler.step()
             epoch_loss += float(loss.item())
-            epoch_masked_loss += float((masked_mse + masked_l1).item())
+            epoch_masked_loss += float(masked_loss.item())
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = epoch_loss / len(dataloader)
@@ -1191,25 +1248,13 @@ def inpaint_h3(
 
     mask = np.ones((1, height, image_array.shape[2]), dtype=np.float32)
     mask[0, start_row:end_row, :] = 0
-    masked_image = image_array.copy()
-    mask_three_channel = np.repeat(mask, 3, axis=0)
-    masked_image[mask_three_channel == 0] = 1.0
-    input_tensor = np.concatenate([masked_image, mask], axis=0).astype(np.float32)
-    input_tensor = torch.from_numpy(input_tensor).float().unsqueeze(0).to(device)
-
-    model.eval()
-    use_amp = device.type == "cuda"
-    if use_amp:
-        with torch.amp.autocast("cuda"):
-            rgb_output = model(input_tensor).squeeze(0).cpu().numpy().astype(np.float32)
-    else:
-        rgb_output = model(input_tensor).squeeze(0).cpu().numpy().astype(np.float32)
+    masked_image, input_array = _build_masked_inpainting_input(image_array, mask)
+    rgb_output = _run_inpainting_model(model, input_array, device)
 
     quantized_rgb, pred_classes = quantizer.quantize_image(rgb_output)
     final_image = image_array.copy()
     final_image[:, start_row:end_row, :] = quantized_rgb[:, start_row:end_row, :]
     h3_cells = quantizer.get_h3_cells_from_indices(pred_classes)
-    del input_tensor
     clear_memory()
     return final_image, mask[0], masked_image, pred_classes, h3_cells, rgb_output
 
@@ -1294,14 +1339,11 @@ def fill_small_gaps_interpolation(
 ) -> tuple[pd.DataFrame, dict[str, int], list[list[int]]]:
     trip_data = prepare_trip_df(
         trip_df,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     )
-    trip_data = trip_data[trip_data["trip_id"] == trip_id].copy()
-    if len(trip_data) == 0:
-        raise ValueError(f"No rows found for trip_id={trip_id}")
-    trip_data = trip_data.sort_values("time").reset_index(drop=True)
+    trip_data = _select_trip_rows(trip_data, trip_id)
 
     if "fill_source" not in trip_data.columns:
         trip_data["fill_source"] = "original"
@@ -1330,31 +1372,10 @@ def fill_small_gaps_interpolation(
     stats = {"small_gaps_filled": 0, "small_segments_filled": 0}
     large_gap_segments: list[list[int]] = []
 
-    def interpolate_coords(
-        time_one: pd.Timestamp,
-        lon_one: float,
-        lat_one: float,
-        time_two: pd.Timestamp,
-        lon_two: float,
-        lat_two: float,
-        target_time: pd.Timestamp,
-    ) -> tuple[float, float]:
-        total_duration = (time_two - time_one).total_seconds()
-        if total_duration == 0:
-            return lon_one, lat_one
-        elapsed = (target_time - time_one).total_seconds()
-        ratio = max(0.0, min(1.0, elapsed / total_duration))
-        return lon_one + ratio * (lon_two - lon_one), lat_one + ratio * (lat_two - lat_one)
-
     for segment_index, segment in enumerate(segments):
         start_index = segment[0]
         end_index = segment[-1]
-        previous_index = start_index - 1
-        while previous_index >= 0 and pd.isna(trip_data.loc[previous_index, "lon"]):
-            previous_index -= 1
-        next_index = end_index + 1
-        while next_index < len(trip_data) and pd.isna(trip_data.loc[next_index, "lon"]):
-            next_index += 1
+        previous_index, next_index = _find_known_trip_neighbors(trip_data, start_index, end_index)
 
         previous_time = trip_data.loc[previous_index, "time"] if previous_index >= 0 else None
         previous_lon = trip_data.loc[previous_index, "lon"] if previous_index >= 0 else None
@@ -1375,7 +1396,7 @@ def fill_small_gaps_interpolation(
         if total_gap_duration < small_gap_threshold_seconds and previous_lon is not None and next_lon is not None:
             for row_index in segment:
                 target_time = trip_data.loc[row_index, "time"]
-                interpolated_lon, interpolated_lat = interpolate_coords(
+                interpolated_lon, interpolated_lat = _interpolate_trip_coords(
                     previous_time,
                     previous_lon,
                     previous_lat,
@@ -1473,31 +1494,10 @@ def fill_large_gaps_from_inpainted_image(
             median_h3 = coords_in_row[len(coords_in_row) // 2][2]
         return median_lon, median_lat, median_h3
 
-    def interpolate_coords(
-        time_one: pd.Timestamp,
-        lon_one: float,
-        lat_one: float,
-        time_two: pd.Timestamp,
-        lon_two: float,
-        lat_two: float,
-        target_time: pd.Timestamp,
-    ) -> tuple[float, float]:
-        total_duration = (time_two - time_one).total_seconds()
-        if total_duration == 0:
-            return lon_one, lat_one
-        elapsed = (target_time - time_one).total_seconds()
-        ratio = max(0.0, min(1.0, elapsed / total_duration))
-        return lon_one + ratio * (lon_two - lon_one), lat_one + ratio * (lat_two - lat_one)
-
     for segment_index, segment in enumerate(large_gap_segments):
         start_index = segment[0]
         end_index = segment[-1]
-        previous_index = start_index - 1
-        while previous_index >= 0 and pd.isna(trip_data.loc[previous_index, "lon"]):
-            previous_index -= 1
-        next_index = end_index + 1
-        while next_index < len(trip_data) and pd.isna(trip_data.loc[next_index, "lon"]):
-            next_index += 1
+        previous_index, next_index = _find_known_trip_neighbors(trip_data, start_index, end_index)
         if previous_index < 0 or next_index >= len(trip_data):
             if verbose:
                 print(f"Large segment {segment_index + 1}: SKIPPED (missing boundary points)")
@@ -1539,7 +1539,7 @@ def fill_large_gaps_from_inpainted_image(
                     break
             if left_anchor is None or right_anchor is None:
                 continue
-            interpolated_lon, interpolated_lat = interpolate_coords(
+            interpolated_lon, interpolated_lat = _interpolate_trip_coords(
                 left_anchor[0],
                 left_anchor[1],
                 left_anchor[2],
@@ -1591,12 +1591,11 @@ def run_inpainting_inference(
 
     trip_data = prepare_trip_df(
         trip_df,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     )
-    trip_data = trip_data[trip_data["trip_id"] == trip_id].copy()
-    trip_data = trip_data.sort_values("time").reset_index(drop=True)
+    trip_data = _select_trip_rows(trip_data, trip_id)
 
     trip_start = trip_data["time"].min()
     trip_end = trip_data["time"].max()
@@ -1645,22 +1644,11 @@ def run_inpainting_inference(
     quantizer = H3ColorQuantizer(h3_color_map)
     model = H3InpaintingModel(in_channels=4, base_ch=base_ch).to(device)
     model.load_state_dict(load_checkpoint_model_state(model_path, map_location=device))
-    model.eval()
 
     image_array = image_array.astype(np.float32)
     mask = (mask_array[0] == 0).astype(np.float32)[np.newaxis, :, :]
-    masked_image = image_array.copy()
-    mask_three_channel = np.repeat(mask, 3, axis=0)
-    masked_image[mask_three_channel == 0] = 1.0
-    input_tensor = np.concatenate([masked_image, mask], axis=0).astype(np.float32)
-    input_tensor = torch.from_numpy(input_tensor).unsqueeze(0).to(device)
-
-    use_amp = device.type == "cuda"
-    if use_amp:
-        with torch.amp.autocast("cuda"):
-            rgb_output = model(input_tensor).squeeze(0).cpu().numpy().astype(np.float32)
-    else:
-        rgb_output = model(input_tensor).squeeze(0).cpu().numpy().astype(np.float32)
+    _, input_array = _build_masked_inpainting_input(image_array, mask)
+    rgb_output = _run_inpainting_model(model, input_array, device)
 
     quantized_rgb, _ = quantizer.quantize_image(rgb_output)
     inpainted_image = image_array.copy()
@@ -1695,12 +1683,11 @@ def run_gap_filling(
 
     trip_data = prepare_trip_df(
         trip_df,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     )
-    trip_data = trip_data[trip_data["trip_id"] == trip_id].copy()
-    trip_data = trip_data.sort_values("time").reset_index(drop=True)
+    trip_data = _select_trip_rows(trip_data, trip_id)
 
     trip_start = trip_data["time"].min()
     trip_end = trip_data["time"].max()
@@ -1823,7 +1810,7 @@ def generate_artificial_gap(
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     trip_data = prepare_trip_df(
         trip_df,
-        required_columns=("trip_id", "time", "lon", "lat", "h3"),
+        required_columns=TRIP_REQUIRED_COLUMNS,
         h3_resolution=h3_resolution,
         rename_map=rename_map,
     ).sort_values("time").reset_index(drop=True)
